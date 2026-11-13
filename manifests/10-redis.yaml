@@ -1,0 +1,107 @@
+# Redis: the task queue, the results and the audit log. One pod, data on a small persistent volume
+# so a restart does not lose the audit log.
+#
+# Passwords live in the Secret "redis-auth" (keys: admin, keda, runner), created by hand and never committed.
+# See manifests/examples/redis-auth.md for a way to create it without a password appearing on screen,
+# in the shell history or in a process argument.
+#
+# Redis users (ACL), so that a leaked password is worth as little as possible:
+#   default  switched off: a connection without a user name gets nothing
+#   admin    everything; used only by labctl, from inside this pod (kubectl exec)
+#   keda     may only ask how long the queues are
+#   gemini   one per runner (passwords in the Secret "redis-runners"): take the next id from its own queue,
+#   claude   read its own task records and fetched repositories, write its own results. Nothing of the other runner.
+#   fetcher  take from queue:fetch, store a fetched repository, hand the task id to the runner's queue,
+#            or write a "fetch failed" result. It cannot read tasks, results or repositories.
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: agents}
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: redis, namespace: agents}
+spec:
+  serviceName: redis
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: redis
+        image: redis:7.4.11-alpine
+        # Passwords go into files in memory, not onto the command line:
+        # process arguments are visible to `ps` and are recorded by Tetragon.
+        command: ["sh", "-c"]
+        args:
+        - |
+          umask 077
+          {
+            echo "user default off"
+            echo "user admin on >$ADMIN_PASSWORD ~* &* +@all"
+            # keda needs the plain key pattern: KEDA asks through a script (EVAL), and Redis wants full key access
+            # for a script's keys. The commands are still limited to "what type is it" and "how long is it".
+            echo "user keda on >$KEDA_PASSWORD ~queue:* +eval +type +llen +ping +hello +auth +client|setinfo"
+            for r in gemini claude; do
+              eval "p=\$RUNNER_PASSWORD_$r"
+              echo "user $r on >$p ~queue:$r %R~task:$r:* %R~repo:$r:* %W~result:$r:* +lpop +get +hset +ping +auth +hello +quit"
+            done
+            echo "user fetcher on >$FETCHER_PASSWORD ~queue:fetch %W~repo:gemini:* %W~queue:gemini %W~result:gemini:* +lpop +set +expire +rpush +hset +ping +auth +hello +quit"
+          } > /tmp/users.acl
+          {
+            echo "aclfile /tmp/users.acl"
+            echo "dir /data"
+            # Snapshots, not the append-only file: replaying that file runs as the "default" user, which is off,
+            # and Redis then drops every write the counting script made (see docs/threat-model.md).
+            echo "appendonly no"
+            echo "save 60 1"
+            echo "maxmemory 200mb"
+            echo "maxmemory-policy noeviction"
+          } > /tmp/redis.conf
+          exec redis-server /tmp/redis.conf
+        env:
+        - name: ADMIN_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-auth, key: admin}}
+        - name: KEDA_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-auth, key: keda}}
+        - name: RUNNER_PASSWORD_gemini
+          valueFrom: {secretKeyRef: {name: redis-runners, key: gemini}}
+        - name: RUNNER_PASSWORD_claude
+          valueFrom: {secretKeyRef: {name: redis-runners, key: claude}}
+        - name: FETCHER_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-fetcher, key: password}}
+        # redis-cli reads this by itself; labctl runs "redis-cli --user admin" inside this container
+        - name: REDISCLI_AUTH
+          valueFrom: {secretKeyRef: {name: redis-auth, key: admin}}
+        ports: [{containerPort: 6379}]
+        readinessProbe:
+          tcpSocket: {port: 6379}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 500m, memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: ["ALL"]}
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: data, mountPath: /data}
+      volumes:
+      - name: tmp
+        emptyDir: {medium: Memory, sizeLimit: 1Mi}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 1Gi}}

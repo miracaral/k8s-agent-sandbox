@@ -1,0 +1,103 @@
+# The ops agent: a pod that can look at the cluster and change nothing.
+# It is the only pod of the platform with a ServiceAccount token, so everything it may do is listed here.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: ops-agent, namespace: agents-ops}
+automountServiceAccountToken: false   # mounted only where the Deployment below asks for it
+---
+# Cluster-wide: read the state of workloads and nodes. Every resource is named; there is no "*".
+# Not in the list on purpose: secrets, configmaps, pods/log, pods/exec, anything under rbac.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: ops-agent-read}
+rules:
+- apiGroups: [""]
+  resources: [nodes, namespaces, pods, services, endpoints, events, persistentvolumeclaims]
+  verbs: [get, list, watch]
+- apiGroups: [apps]
+  resources: [deployments, statefulsets, daemonsets, replicasets]
+  verbs: [get, list, watch]
+- apiGroups: [batch]
+  resources: [jobs, cronjobs]
+  verbs: [get, list, watch]
+- apiGroups: [events.k8s.io]
+  resources: [events]
+  verbs: [get, list, watch]
+- apiGroups: [metrics.k8s.io]
+  resources: [nodes, pods]
+  verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: ops-agent-read}
+subjects:
+- {kind: ServiceAccount, name: ops-agent, namespace: agents-ops}
+roleRef: {kind: ClusterRole, name: ops-agent-read, apiGroup: rbac.authorization.k8s.io}
+---
+# Logs: only in the namespaces that have this Role and RoleBinding. To let the ops agent read logs
+# of another namespace, copy the two objects into it. Nothing cluster-wide grants pods/log.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ops-agent-logs, namespace: agents}
+rules:
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ops-agent-logs, namespace: agents}
+subjects:
+- {kind: ServiceAccount, name: ops-agent, namespace: agents-ops}
+roleRef: {kind: Role, name: ops-agent-logs, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ops-agent-logs, namespace: agents-ops}
+rules:
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ops-agent-logs, namespace: agents-ops}
+subjects:
+- {kind: ServiceAccount, name: ops-agent, namespace: agents-ops}
+roleRef: {kind: Role, name: ops-agent-logs, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ops-agent, namespace: agents-ops, labels: {app: ops-agent}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: ops-agent}}
+  template:
+    metadata: {labels: {app: ops-agent}}
+    spec:
+      serviceAccountName: ops-agent
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: ops
+        image: ghcr.io/miracaral/k8s-agent-sandbox-ops:0.1.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - {name: HOME, value: /tmp}   # kubectl wants a writable place for its cache
+        resources:
+          requests: {cpu: 20m, memory: 32Mi}
+          limits: {cpu: 500m, memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: ["ALL"]}
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: tmp
+        emptyDir: {sizeLimit: 16Mi}

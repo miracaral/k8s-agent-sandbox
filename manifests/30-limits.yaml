@@ -1,0 +1,11 @@
+# The brakes on cost. labctl reads these three numbers every time it queues a task or switches agents on.
+# Change a value with:  kubectl -n agents edit configmap agent-limits   (or edit this file and apply it)
+# A new value counts from the next "labctl run"; the timeout and the parallel limit reach the runners
+# at the next "labctl agents on".
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: agent-limits, namespace: agents}
+data:
+  dailyTaskLimit: "10"          # tasks that may be queued per day (UTC). Allowed: 1 to 500
+  taskTimeoutSeconds: "900"     # one task is stopped after this long. Allowed: 30 to 7200
+  maxParallelPerRunner: "1"     # task pods at the same time, per runner. Allowed: 1 to 5

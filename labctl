@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""labctl: one command for the agent sandbox.
+
+Runs on your own machine. Every action goes to the cluster as a kubectl command,
+by default over SSH to the control-plane node. Nothing in the cluster is exposed
+for it: no Ingress, no NodePort, no port-forward.
+
+Settings (environment variables):
+  LABCTL_SSH_HOST   SSH host that has kubectl (default: cp-1). "local" runs kubectl here.
+  LABCTL_KUBECTL    kubectl command on that host (default: "sudo -n k3s kubectl")
+"""
+import argparse
+import datetime
+import getpass
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+NS_AGENTS = "agents"
+NS_OPS = "agents-ops"
+SSH_HOST = os.environ.get("LABCTL_SSH_HOST", "cp-1")
+KUBECTL = os.environ.get("LABCTL_KUBECTL", "sudo -n k3s kubectl")
+
+
+def kubectl(*args, stdin=None):
+    """Run one kubectl command on the cluster and return (exit code, stdout, stderr)."""
+    cmd = KUBECTL + " " + " ".join(shlex.quote(a) for a in args)
+    argv = ["sh", "-c", cmd] if SSH_HOST == "local" else ["ssh", "-o", "BatchMode=yes", SSH_HOST, cmd]
+    p = subprocess.run(argv, input=stdin, capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def redis(*command):
+    """Run one Redis command as the admin user, inside the Redis pod. Returns the output lines.
+
+    The command travels on stdin, so task text never becomes a process argument on the way.
+    The password is not handled here at all: redis-cli finds it in the pod's own environment.
+    """
+    def quote(arg):
+        arg = str(arg).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+        return f'"{arg}"'
+    line = " ".join(quote(a) for a in command) + "\n"
+    rc, out, err = kubectl("-n", NS_AGENTS, "exec", "-i", "redis-0", "--",
+                           "redis-cli", "--user", "admin", "--no-auth-warning", stdin=line)
+    if rc != 0 or out.startswith(("ERR", "NOPERM", "NOAUTH", "WRONGPASS")) or "AUTH failed" in out:
+        raise RuntimeError((err or out).strip()[:300] or "no answer from Redis")
+    return out.splitlines()
+
+
+def audit(action, detail="", required=False):
+    """Append one line to the audit log (a Redis stream; Redis stamps the time, not this machine).
+
+    required=True is for actions that change something: if the log cannot be written, the action does not happen.
+    """
+    entry = json.dumps({"actor": getpass.getuser(), "action": action, "detail": detail}, ensure_ascii=False)
+    try:
+        redis("XADD", "audit", "MAXLEN", "~", "10000", "*", "e", entry)
+    except RuntimeError as e:
+        if required:
+            sys.exit(f"labctl: audit log is not writable, so nothing was done: {e}")
+        print(f"labctl: warning: could not write to the audit log: {e}", file=sys.stderr)
+
+
+def show_audit(args):
+    try:
+        lines = redis("XREVRANGE", "audit", "+", "-", "COUNT", args.n)
+    except RuntimeError as e:
+        sys.exit(f"labctl: could not read the audit log: {e}")
+    rows = [lines[i:i + 3] for i in range(0, len(lines) - 2, 3)]   # id, field name, JSON
+    if not rows:
+        print("The audit log is empty.")
+        return 0
+    print(f"{'TIME (UTC)':<20} {'WHO':<12} {'ACTION':<16} DETAIL")
+    for entry_id, _field, raw in reversed(rows):
+        when = datetime.datetime.fromtimestamp(int(entry_id.split("-")[0]) / 1000, datetime.timezone.utc)
+        e = json.loads(raw)
+        print(f"{when:%Y-%m-%d %H:%M:%S}  {e.get('actor', '?'):<12} {e.get('action', '?'):<16} {e.get('detail', '')}")
+    return 0
+
+
+LIMITS = {   # name in the ConfigMap "agent-limits": (lowest, highest) allowed value
+    "dailyTaskLimit": (1, 500),
+    "taskTimeoutSeconds": (30, 7200),
+    "maxParallelPerRunner": (1, 5),
+}
+
+# One atomic step in Redis: is the platform on, is there room under today's limit, then count and queue.
+# Nothing can slip in between the check and the queueing. "Today" is Redis's clock (UTC day number).
+# KEYS: platform:state, the queue, the task record.  ARGV: daily limit, task JSON, task id.
+ENQUEUE_SCRIPT = (
+    "if redis.call('GET', KEYS[1]) ~= 'on' then return {'off', 0, 0} end "
+    "local day = math.floor(tonumber(redis.call('TIME')[1]) / 86400) "
+    "local key = 'count:' .. day "
+    "local used = tonumber(redis.call('GET', key) or '0') "
+    "if used >= tonumber(ARGV[1]) then return {'limit', used, day} end "
+    "used = redis.call('INCR', key) "
+    "redis.call('EXPIRE', key, 691200) "
+    "redis.call('SET', KEYS[3], ARGV[2], 'EX', 2592000) "
+    "redis.call('RPUSH', KEYS[2], ARGV[3]) "
+    "return {'ok', used, day}"
+)
+
+
+def limits():
+    """Read and check the three limits. A missing, non-numeric or out-of-range value stops labctl:
+    a broken setting must never mean "no limit"."""
+    rc, out, err = kubectl("-n", NS_AGENTS, "get", "configmap", "agent-limits", "-o", "jsonpath={.data}")
+    if rc != 0:
+        sys.exit(f"labctl: cannot read the limits (ConfigMap agent-limits): {err.strip()[:200]}")
+    try:
+        data = json.loads(out or "{}")
+    except ValueError:
+        data = {}
+    result = {}
+    for name, (low, high) in LIMITS.items():
+        raw = data.get(name, "")
+        if not raw.isdigit() or not low <= int(raw) <= high:
+            sys.exit(f"labctl: limit {name}={raw!r} is not a number from {low} to {high}. "
+                     "Nothing was done. Fix it: kubectl -n agents edit configmap agent-limits")
+        result[name] = int(raw)
+    return result
+
+
+def enqueue(runner, task_id, task, queue=None, item=None):
+    """Count the task against today's limit and put it in a queue: the runner's own, or the fetcher's
+    when a repository has to be cloned first. Returns (outcome, used_today, limit); outcome is 'ok', 'off' or 'limit'."""
+    lim = limits()
+    outcome, used, _day = redis("EVAL", ENQUEUE_SCRIPT, 3, "platform:state", queue or f"queue:{runner}",
+                                f"task:{runner}:{task_id}", lim["dailyTaskLimit"],
+                                json.dumps(task, ensure_ascii=False), item or task_id)
+    if outcome == "limit":
+        # Tripwire: an attempt beyond the limit may be something calling labctl in a loop. Pull the brake.
+        try:
+            redis("SET", "platform:state", "off")
+        except RuntimeError:
+            pass
+        failed = set_paused(True)
+        audit("limit reached", f"daily limit {lim['dailyTaskLimit']} used up; task {task_id} refused; agents switched off"
+              + ("; " + "; ".join(failed) if failed else ""))
+    return outcome, int(used), lim["dailyTaskLimit"]
+
+
+def apply_limits(lim):
+    """Write the timeout and the parallel limit into every runner (ScaledJob)."""
+    patch = json.dumps({"spec": {"maxReplicaCount": lim["maxParallelPerRunner"],
+                                 "jobTargetRef": {"activeDeadlineSeconds": lim["taskTimeoutSeconds"]}}})
+    failed = []
+    for name, _ in scaledjobs():
+        rc, _out, err = kubectl("-n", NS_AGENTS, "patch", "scaledjob", name, "--type", "merge", "-p", patch)
+        if rc != 0:
+            failed.append(f"{name}: {err.strip()[:200]}")
+    return failed
+
+
+def budget(_args):
+    lim = limits()
+    try:
+        day = int(redis("TIME")[0]) // 86400
+        counts = redis("MGET", *[f"count:{day - i}" for i in range(8)])
+    except RuntimeError as e:
+        sys.exit(f"labctl: could not ask Redis: {e}")
+    used = [int(c) if c.isdigit() else 0 for c in counts]
+    date = lambda d: (datetime.date(1970, 1, 1) + datetime.timedelta(days=d)).isoformat()
+    left = max(lim["dailyTaskLimit"] - used[0], 0)
+    print(f"Today ({date(day)} UTC):  {used[0]} of {lim['dailyTaskLimit']} tasks used, {left} left")
+    print(f"Per-task timeout:        {lim['taskTimeoutSeconds']} s")
+    print(f"Parallel per runner:     {lim['maxParallelPerRunner']}")
+    print(f"Platform:                {platform_state().upper()}")
+    rc, out, _err = kubectl("-n", NS_AGENTS, "get", "scaledjobs", "-o",
+                            "jsonpath={range .items[*]}{.metadata.name}{' '}{.spec.maxReplicaCount}{' '}{.spec.jobTargetRef.activeDeadlineSeconds}{'\\n'}{end}")
+    if rc != 0:
+        sys.exit(f"labctl: could not read the runners: {_err.strip()[:200]}")
+    print("Runners:")
+    rows = [l.split() for l in out.splitlines() if l.strip()]
+    for row in rows:
+        ok = row[1:] == [str(lim["maxParallelPerRunner"]), str(lim["taskTimeoutSeconds"])]
+        print(f"  {row[0]:<20} " + ("in sync" if ok else f"NOT in sync (parallel {row[1] if len(row) > 1 else '?'}, "
+              f"timeout {row[2] if len(row) > 2 else '?'}); run: labctl agents on"))
+    if not rows:
+        print("  none")
+    print("Last 7 days:             " + "   ".join(f"{date(day - i)[5:]}: {used[i]}" for i in range(1, 8)))
+    return 0
+
+
+RUNNERS = ("gemini",)          # runners that exist in this version; "claude" is planned
+MAX_INSTRUCTION = 8000         # characters
+REPO_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")   # the fetcher checks the same
+
+
+def run(args):
+    if args.runner not in RUNNERS:
+        sys.exit(f"labctl: the {args.runner} runner is not built yet (planned). Available: {', '.join(RUNNERS)}")
+    if args.repo and not REPO_URL.fullmatch(args.repo):
+        sys.exit("labctl: --repo must be a public GitHub repository: https://github.com/<owner>/<name>")
+    text = args.instruction.strip()
+    if not text or len(text) > MAX_INSTRUCTION:
+        sys.exit(f"labctl: the instruction must be 1 to {MAX_INSTRUCTION} characters")
+    lim = limits()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    task_id = f"t-{now:%Y%m%d-%H%M%S}-{os.urandom(2).hex()}"
+    task = {"version": 1, "id": task_id, "created_at": now.isoformat(timespec="seconds"), "runner": args.runner,
+            "role": "worker", "instruction": text, "repo": args.repo, "parent_task_id": None, "inputs": [],
+            "pipeline_id": None, "timeout_seconds": lim["taskTimeoutSeconds"]}
+    audit("run requested", f"{task_id} {args.runner}", required=True)   # no record, no task
+    if args.repo:   # the fetcher clones it first, then puts the task id into the runner's queue
+        outcome, used, limit = enqueue(args.runner, task_id, task, "queue:fetch", f"{args.runner} {task_id} {args.repo}")
+    else:
+        outcome, used, limit = enqueue(args.runner, task_id, task)
+    if outcome == "off":
+        audit("run refused", f"{task_id}: agents are off")
+        sys.exit("labctl: agents are OFF, the task was not queued. Switch on with: labctl agents on")
+    if outcome == "limit":
+        sys.exit(f"labctl: daily limit reached ({limit}). The task was NOT queued and agents were switched OFF.")
+    audit("run queued", f"{task_id} {args.runner}: {text[:60]}")
+    print(f"Queued {task_id} for {args.runner} ({used} of {limit} today). Result: labctl result {task_id}")
+    return 0
+
+
+def result(args):
+    task_id = args.task_id
+    if not task_id.startswith("t-") or any(c in task_id for c in " *?[]:"):
+        sys.exit("labctl: not a task id")
+    for runner in RUNNERS:
+        # Field by field: the summary can span many lines, which would break a HGETALL reply split into lines.
+        names = ["status", "exit_code", "started_at", "finished_at", "truncated", "model"]
+        values = redis("HMGET", f"result:{runner}:{task_id}", *names)
+        if values and values[0]:
+            r = dict(zip(names, values))
+            r["summary"] = "\n".join(redis("HGET", f"result:{runner}:{task_id}", "summary"))
+            print(f"Task:     {task_id} ({runner})")
+            print(f"Status:   {r.get('status', '?')}   exit code {r.get('exit_code') or '-'}")
+            print(f"Model:    {r.get('model') or '-'}")
+            print(f"Started:  {r.get('started_at', '-')}\nFinished: {r.get('finished_at', '-')}")
+            if r.get("truncated") == "true":
+                print("Note:     output was cut at 64 KiB")
+            print("\n" + r.get("summary", "(no output)"))
+            return 0 if r.get("status") == "succeeded" else 1
+        if redis("EXISTS", f"task:{runner}:{task_id}") == ["1"]:
+            waiting = task_id in redis("LRANGE", f"queue:{runner}", 0, -1)
+            fetching = any(f" {task_id} " in i for i in redis("LRANGE", "queue:fetch", 0, -1))
+            state = "waiting for its repository to be fetched" if fetching else "waiting in the queue" if waiting else "running"
+            print(f"{task_id}: {state} ({runner})")
+            return 2
+    sys.exit(f"labctl: no task {task_id} (tasks and results are kept 30 days)")
+
+
+PAUSE = "autoscaling.keda.sh/paused"   # KEDA starts no new Job for a ScaledJob that carries this annotation
+
+
+def scaledjobs():
+    """Names of all ScaledJobs in the agents namespace, with whether each is paused."""
+    rc, out, err = kubectl("-n", NS_AGENTS, "get", "scaledjobs", "-o",
+                           r"jsonpath={range .items[*]}{.metadata.name}{' '}{.metadata.annotations.autoscaling\.keda\.sh/paused}{'\n'}{end}")
+    if rc != 0:
+        sys.exit(f"labctl: could not list ScaledJobs: {err.strip()[:300]}")
+    return [(parts[0], len(parts) > 1 and parts[1] == "true") for parts in (l.split() for l in out.splitlines()) if parts]
+
+
+def set_paused(paused):
+    failed = []
+    for name, _ in scaledjobs():
+        arg = f"{PAUSE}=true" if paused else f"{PAUSE}-"
+        rc, _out, err = kubectl("-n", NS_AGENTS, "annotate", "scaledjob", name, arg, "--overwrite")
+        if rc != 0:
+            failed.append(f"{name}: {err.strip()[:200]}")
+    return failed
+
+
+def platform_state():
+    """'on' or 'off'. Anything else, including a missing key or an unreachable Redis, counts as off."""
+    try:
+        return "on" if redis("GET", "platform:state") == ["on"] else "off"
+    except RuntimeError:
+        return "off"
+
+
+def agents(args):
+    if args.action == "status":
+        return agents_status()
+    if args.action == "on":
+        lim = limits()                              # broken limits, no switching on
+        audit("agents on", required=True)           # no record, no switching on
+        failed = apply_limits(lim)
+        if failed:
+            sys.exit("labctl: could not write the limits into the runners, agents stay off: " + "; ".join(failed))
+        redis("SET", "platform:state", "on")
+        failed = set_paused(False)
+        if failed:
+            sys.exit("labctl: could not switch on: " + "; ".join(failed))
+        print("Agents are ON: queued tasks will start.")
+        return 0
+    # off and kill are the brakes: they go on even if the audit log or Redis cannot be reached
+    try:
+        redis("SET", "platform:state", "off")
+    except RuntimeError as e:
+        print(f"labctl: warning: could not store the state in Redis: {e}", file=sys.stderr)
+    failed = set_paused(True)
+    if args.action == "off":
+        audit("agents off", "; ".join(failed))
+        if failed:
+            sys.exit("labctl: NOT fully off: " + "; ".join(failed))
+        print("Agents are OFF: no new task pod will start. A task that is already running finishes.")
+        return 0
+    # Jobs first, so nothing recreates a pod; then the pods with a one-second grace period,
+    # because an emergency stop should not wait for a process that ignores the polite signal.
+    # Which tasks are running, so their result can say "killed" rather than "timeout" (the pods cannot tell).
+    rc, pods, _err = kubectl("-n", NS_AGENTS, "get", "pods", "-l", "job-name", "--field-selector", "status.phase=Running",
+                             "-o", "jsonpath={range .items[*]}{.metadata.name} {.metadata.labels.agent-sandbox/runner}{'\\n'}{end}")
+    running = []
+    for line in pods.splitlines():
+        name, _, runner = line.partition(" ")
+        rc_id, task_id, _ = kubectl("-n", NS_AGENTS, "exec", name, "-c", "report", "--", "cat", "/meta/id")
+        if rc_id == 0 and task_id.strip() and runner:
+            running.append((runner, task_id.strip()))
+    rc, out, err = kubectl("-n", NS_AGENTS, "delete", "jobs", "--all", "--wait=false")
+    stopped = [l for l in out.splitlines() if l.startswith("job")]
+    rc2, _out2, err2 = kubectl("-n", NS_AGENTS, "delete", "pods", "-l", "job-name", "--grace-period=1", "--wait=true", "--timeout=60s")
+    rc, err = rc or rc2, err + err2
+    for runner, task_id in running:     # after the pods are gone, so the report container cannot overwrite it
+        try:
+            redis("HSET", f"result:{runner}:{task_id}", "status", "killed")
+        except RuntimeError as e:
+            print(f"labctl: warning: could not mark {task_id} as killed: {e}", file=sys.stderr)
+    audit("agents kill", f"{len(stopped)} job(s) deleted" + (f"; killed {', '.join(t for _, t in running)}" if running else "") + ("; " + "; ".join(failed) if failed else ""))
+    if rc != 0 or failed:
+        sys.exit(f"labctl: kill did NOT complete: {err.strip()[:300]} {'; '.join(failed)}")
+    print(f"Agents are OFF and {len(stopped)} running or finished task job(s) were deleted. "
+          "Tasks still waiting in the queue stay there; a task that was running is gone and is not put back.")
+    return 0
+
+
+def agents_status():
+    print(f"Platform: {platform_state().upper()}")
+    print("Runners (ScaledJobs):")
+    sj = scaledjobs()
+    for name, paused in sj:
+        print(f"  {name:<20} {'paused' if paused else 'active'}")
+    if not sj:
+        print("  none")
+    rc, out, _err = kubectl("-n", NS_AGENTS, "get", "pods", "-l", "job-name", "--no-headers",
+                            "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,STARTED:.status.startTime")
+    print("Task pods:")
+    print("\n".join("  " + l for l in out.splitlines()) if out.strip() else "  none")
+    print("Queues:")
+    try:
+        queues = sorted(q for q in redis("KEYS", "queue:*") if q)
+        for q in queues:
+            print(f"  {q:<20} {redis('LLEN', q)[0]} waiting")
+        if not queues:
+            print("  all empty")
+    except RuntimeError as e:
+        print(f"  could not ask Redis: {e}")
+    return 0
+
+
+# Runs inside the ops agent pod, with the pod's read-only ServiceAccount. Plain kubectl and awk, no AI.
+# Last line is "RESULT ok" or "RESULT problems"; labctl turns that into its exit code.
+HEALTH_SCRIPT = r"""
+bad=0
+echo "== Nodes"
+N=$(kubectl get nodes --no-headers 2>&1) || { echo "cannot read nodes: $N"; echo "RESULT problems"; exit 0; }
+echo "$N" | awk '{t++; if ($2=="Ready") r++; else print "  NOT READY: " $1 " (" $2 ")"} END {print "  " r+0 " of " t " Ready"; exit (r==t)?0:1}' || bad=1
+echo "== Node usage"
+kubectl top nodes --no-headers 2>/dev/null | awk '{printf "  %-16s cpu %-5s memory %s\n", $1, $3, $5; if ($5+0 >= 85) hot=1} END {if (NR==0) print "  (no metrics)"; exit hot}' || { echo "  memory at 85% or more on a node"; bad=1; }
+echo "== Pods"
+P=$(kubectl get pods -A --no-headers 2>&1)
+echo "$P" | awk '{t++; split($3,a,"/"); ok=($4=="Completed" || ($4=="Running" && a[1]==a[2])); if (!ok) {b++; print "  PROBLEM: " $1 "/" $2 "  " $4 "  ready " $3}} END {print "  " t-b " of " t " healthy"; exit b?1:0}' || bad=1
+echo "== Most restarted pods (total since each pod was created)"
+echo "$P" | awk '$5+0 > 0 {print $5, $1 "/" $2, $6, $7, $8}' | sort -rn | head -5 | awk '{printf "  %-4s %s %s %s %s\n", $1, $2, $3, $4, $5} END {if (NR==0) print "  none"}'
+echo "== Warning events still kept by the cluster (about the last hour)"
+kubectl get events -A --field-selector type=Warning --no-headers 2>/dev/null | awk '{c[$1 " " $4]++} END {for (k in c) {n++; printf "  %-4s %s\n", c[k], k}; if (!n) print "  none"}' | sort -rn | head -10
+echo "== Agent platform"
+for ns in agents agents-ops; do echo "  $ns: $(echo "$P" | awk -v n=$ns '$1==n' | wc -l | tr -d ' ') pods"; done
+[ $bad = 0 ] && echo "RESULT ok" || echo "RESULT problems"
+"""
+
+
+def ops_health(_args):
+    rc, out, err = kubectl("-n", NS_OPS, "exec", "-i", "deploy/ops-agent", "--", "sh", "-s", stdin=HEALTH_SCRIPT)
+    if rc != 0 or "RESULT " not in out:
+        sys.exit(f"labctl: could not run the health check in the ops agent pod: {(err or out).strip()[:300]}")
+    lines = out.rstrip().splitlines()
+    print("\n".join(lines[:-1]))
+    ok = lines[-1] == "RESULT ok"
+    audit("ops health", "ok" if ok else "problems")
+    print("\nCluster looks healthy." if ok else "\nSomething needs a look (lines marked PROBLEM or NOT READY above).")
+    return 0 if ok else 1
+
+
+def not_yet(step):
+    def run(_args):
+        sys.exit(f"labctl: not implemented yet (planned for step {step})")
+    return run
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="labctl",
+        description="Control the agent sandbox: switch agents on and off, queue tasks, read results, check the cluster.",
+        epilog="Manual: docs/labctl-manual.md",
+    )
+    p.add_argument("--version", action="version", version=f"labctl {VERSION}")
+    sub = p.add_subparsers(dest="command", metavar="<command>")
+
+    agents_p = sub.add_parser("agents", help="switch task agents on or off, stop them, show their state")
+    agents_p.add_argument("action", choices=["on", "off", "kill", "status"],
+                        help="on: accept tasks; off: start no new task pods; kill: off + stop running pods; status: show state")
+    agents_p.set_defaults(func=agents)
+
+    run_p = sub.add_parser("run", help="queue one task for an agent")
+    run_p.add_argument("runner", choices=["claude", "gemini"], help="which agent runs the task")
+    run_p.add_argument("instruction", help="what the agent should do, in quotes")
+    run_p.add_argument("--repo", metavar="URL", help="public Git repository to fetch into /workspace")
+    run_p.set_defaults(func=run)
+
+    result_p = sub.add_parser("result", help="show the result of a task")
+    result_p.add_argument("task_id")
+    result_p.set_defaults(func=result)
+
+    ops = sub.add_parser("ops", help="read-only view of the cluster")
+    ops_sub = ops.add_subparsers(dest="ops_command", metavar="<ops command>", required=True)
+    ops_sub.add_parser("health", help="nodes, pods and recent problems, no AI involved").set_defaults(func=ops_health)
+    ask = ops_sub.add_parser("ask", help="ask the read-only ops agent a question")
+    ask.add_argument("question")
+    ask.set_defaults(func=not_yet("3i"))
+
+    aud = sub.add_parser("audit", help="show the audit log: who did what, and when")
+    aud.add_argument("-n", type=int, default=20, metavar="N", help="how many of the newest entries (default: 20)")
+    aud.set_defaults(func=show_audit)
+
+    sub.add_parser("budget", help="tasks used today, the daily limit, the per-task timeout").set_defaults(func=budget)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return 0
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,44 @@
+# Test fixture: two short-lived pods that carry the labels (and so the network rules and Redis user) of
+# a fetcher pod and of a Gemini task pod, to test what each can reach. Deleted by tests/fetcher-test.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netcheck-fetcher
+  namespace: agents
+  labels: {agent-sandbox/redis-client: "true", agent-sandbox/role: fetcher}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  nodeSelector: {kubernetes.io/hostname: worker-1}
+  securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+  containers:
+  - name: main
+    image: ghcr.io/miracaral/k8s-agent-sandbox-fetcher:0.1.0
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "120"]
+    env:
+    - name: REDISCLI_AUTH
+      valueFrom: {secretKeyRef: {name: redis-fetcher, key: password}}
+    resources: {limits: {cpu: 200m, memory: 64Mi}}
+    securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netcheck-agent
+  namespace: agents
+  labels: {agent-sandbox/redis-client: "true", agent-sandbox/runner: gemini}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  nodeSelector: {kubernetes.io/hostname: worker-1}
+  securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+  containers:
+  - name: main
+    image: ghcr.io/miracaral/k8s-agent-sandbox-fetcher:0.1.0
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "120"]
+    resources: {limits: {cpu: 200m, memory: 64Mi}}
+    securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}

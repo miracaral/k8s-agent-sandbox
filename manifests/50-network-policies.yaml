@@ -1,0 +1,121 @@
+# Network policies (Cilium). The rule for this whole repository: every pod starts with nothing,
+# and each later step adds the one path it needs. No rule ever allows 0.0.0.0/0: on a home network
+# Cilium sees the hypervisor and the router as "world", the same as the internet.
+
+# 1) Default deny, both directions, both namespaces
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: default-deny, namespace: agents}
+spec:
+  endpointSelector: {}
+  ingress:
+  - {}
+  egress:
+  - {}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: default-deny, namespace: agents-ops}
+spec:
+  endpointSelector: {}
+  ingress:
+  - {}
+  egress:
+  - {}
+---
+# 2) DNS only, through the cluster's own resolver. The "rules: dns" part sends lookups through
+#    Cilium's DNS proxy, which the toFQDNs rules of later steps depend on.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: allow-dns, namespace: agents}
+spec:
+  endpointSelector: {}
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s-app: kube-dns
+    toPorts:
+    - ports: [{port: "53", protocol: ANY}]
+      rules:
+        dns: [{matchPattern: "*"}]
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: allow-dns, namespace: agents-ops}
+spec:
+  endpointSelector: {}
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s-app: kube-dns
+    toPorts:
+    - ports: [{port: "53", protocol: ANY}]
+      rules:
+        dns: [{matchPattern: "*"}]
+---
+# 3) Ops agent -> Kubernetes API server, and nothing else. No rule lets anything connect to the ops agent.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: ops-to-apiserver, namespace: agents-ops}
+spec:
+  endpointSelector: {matchLabels: {app: ops-agent}}
+  egress:
+  - toEntities: [kube-apiserver]
+    toPorts:
+    - ports: [{port: "6443", protocol: TCP}]
+---
+# 4) Who may connect to Redis: KEDA's operator (to measure the queues) and pods that carry the
+#    redis-client label. Nothing else, from this namespace or any other.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: redis-ingress, namespace: agents}
+spec:
+  endpointSelector: {matchLabels: {app: redis}}
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: keda
+        app: keda-operator
+    - matchLabels:
+        agent-sandbox/redis-client: "true"
+    toPorts:
+    - ports: [{port: "6379", protocol: TCP}]
+---
+# 5) Pods with the redis-client label may connect to Redis. This is their only path besides DNS.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: redis-clients-egress, namespace: agents}
+spec:
+  endpointSelector: {matchLabels: {agent-sandbox/redis-client: "true"}}
+  egress:
+  - toEndpoints:
+    - matchLabels: {app: redis}
+    toPorts:
+    - ports: [{port: "6379", protocol: TCP}]
+---
+# 6) Gemini task pods -> the Gemini API, by name, port 443 only. The DNS rule above (rules: dns) is what
+#    lets Cilium learn the addresses behind the name. No other host on the internet or the local network.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: gemini-egress, namespace: agents}
+spec:
+  endpointSelector: {matchLabels: {agent-sandbox/runner: gemini}}
+  egress:
+  - toFQDNs:
+    - matchName: generativelanguage.googleapis.com
+    toPorts:
+    - ports: [{port: "443", protocol: TCP}]
+---
+# 7) Fetcher pods -> github.com, by name, port 443 only. Nothing else on the internet; the agent pod has no such rule.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: fetcher-egress, namespace: agents}
+spec:
+  endpointSelector: {matchLabels: {agent-sandbox/role: fetcher}}
+  egress:
+  - toFQDNs:
+    - matchName: github.com
+    toPorts:
+    - ports: [{port: "443", protocol: TCP}]
