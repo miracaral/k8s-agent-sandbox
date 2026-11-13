@@ -1,0 +1,21 @@
+# Two namespaces, both locked to Pod Security "restricted" from the first minute:
+# no privileged pod, no root, no host mounts, no host namespaces can be created in them.
+#   agents      the queue (Redis) and the short-lived task pods
+#   agents-ops  the read-only ops agent, kept apart so its ServiceAccount is never next to a task pod
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents-ops
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

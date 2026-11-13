@@ -1,0 +1,95 @@
+# The fetcher. For a task queued with --repo, it clones the public repository and stores it in Redis
+# as a compressed archive, then puts the task id into the runner's queue. It is a pod of its own because a
+# network policy applies to a whole pod: this way only the fetcher can reach github.com, and the agent
+# pod, which holds the model API key, cannot. The fetcher holds no GitHub credential and no API key.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: fetcher
+  namespace: agents
+  annotations:
+    autoscaling.keda.sh/paused: "true"
+spec:
+  pollingInterval: 5
+  maxReplicaCount: 1
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  jobTargetRef:
+    backoffLimit: 0
+    activeDeadlineSeconds: 300
+    ttlSecondsAfterFinished: 3600
+    template:
+      metadata:
+        labels:
+          agent-sandbox/redis-client: "true"
+          agent-sandbox/role: fetcher
+      spec:
+        restartPolicy: Never
+        automountServiceAccountToken: false
+        enableServiceLinks: false
+        terminationGracePeriodSeconds: 5
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - {key: kubernetes.io/hostname, operator: In, values: [worker-1]}
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+        - name: fetch
+          image: ghcr.io/miracaral/k8s-agent-sandbox-fetcher:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+          - |
+            umask 077
+            r() { redis-cli -h redis.agents.svc.cluster.local --user fetcher --no-auth-warning "$@"; }
+            item=$(r --raw LPOP queue:fetch)
+            [ -n "$item" ] || { echo "queue empty"; exit 0; }
+            set -- $item; runner=$1; id=$2; url=$3
+            case "$id" in t-[0-9]*) ;; *) echo "malformed item"; exit 0 ;; esac
+            fail() { r HSET "result:$runner:$id" status failed model - summary "fetch failed: $1" >/dev/null; echo "$id: $1"; exit 0; }
+            [ "$runner" = gemini ] || fail "unknown runner"
+            echo "$url" | grep -qE '^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || fail "not a github.com repository URL"
+            # No credentials, no prompts, no hooks, https only, newest commit only.
+            export HOME=/tmp GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1
+            timeout 120 git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.https.allow=always \
+              clone --quiet --depth 1 --single-branch --no-tags "$url" /work/repo || fail "git clone failed or took longer than 120 s"
+            rm -rf /work/repo/.git
+            tar -C /work -czf /work/repo.tgz repo
+            size=$(wc -c < /work/repo.tgz)
+            [ "$size" -le 20971520 ] || fail "repository is larger than 20 MB compressed ($size bytes)"
+            base64 -w 0 /work/repo.tgz | r -x SET "repo:$runner:$id" >/dev/null || fail "could not store the repository"
+            r EXPIRE "repo:$runner:$id" 3600 >/dev/null
+            r RPUSH "queue:$runner" "$id" >/dev/null
+            echo "$id: fetched $url ($size bytes compressed)"
+          env:
+          - name: REDISCLI_AUTH
+            valueFrom: {secretKeyRef: {name: redis-fetcher, key: password}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+          - {name: work, mountPath: /work}
+          - {name: tmp, mountPath: /tmp}
+        volumes:
+        - name: work
+          emptyDir: {sizeLimit: 512Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+  triggers:
+  - type: redis
+    metadata:
+      address: redis.agents.svc.cluster.local:6379
+      username: keda
+      listName: queue:fetch
+      listLength: "1"
+    authenticationRef: {name: redis-keda}

@@ -1,0 +1,8 @@
+# How KEDA logs in to Redis: as the "keda" user, which may only measure queue length.
+# Every ScaledJob in this namespace points here with "authenticationRef: {name: redis-keda}".
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata: {name: redis-keda, namespace: agents}
+spec:
+  secretTargetRef:
+  - {parameter: password, name: redis-auth, key: keda}

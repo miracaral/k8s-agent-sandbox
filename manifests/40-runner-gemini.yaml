@@ -1,0 +1,147 @@
+# The Gemini runner. KEDA starts one Job per queued task id; each pod has three containers, so that
+# no container holds both a Redis password and the model API key:
+#   take    (init)  Redis password only. Takes the next id from queue:gemini, writes the task to /workspace.
+#   agent           API key only. Runs the Gemini CLI on the task; writes /workspace/out.
+#   report          Redis password only. Waits for /workspace/out/done, writes the result to Redis.
+# The task id lives in /meta, which the agent container does not mount.
+# The ScaledJob arrives paused; "labctl agents on" starts it and writes the timeout and parallel limit into it.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: gemini-runner
+  namespace: agents
+  annotations:
+    autoscaling.keda.sh/paused: "true"
+spec:
+  pollingInterval: 5
+  maxReplicaCount: 1
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  jobTargetRef:
+    backoffLimit: 0
+    activeDeadlineSeconds: 900
+    ttlSecondsAfterFinished: 3600
+    template:
+      metadata:
+        labels:
+          agent-sandbox/redis-client: "true"
+          agent-sandbox/runner: gemini
+      spec:
+        restartPolicy: Never
+        automountServiceAccountToken: false
+        enableServiceLinks: false
+        terminationGracePeriodSeconds: 10
+        # The image is loaded onto this worker only for now (no registry before the audit; worker-2 to follow).
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - {key: kubernetes.io/hostname, operator: In, values: [worker-1]}
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          seccompProfile: {type: RuntimeDefault}
+        initContainers:
+        - name: take
+          image: redis:7.4.11-alpine
+          command: ["sh", "-c"]
+          args:
+          - |
+            set -e; umask 077
+            r() { redis-cli -h redis.agents.svc.cluster.local --user gemini --no-auth-warning --raw "$@"; }
+            id=$(r LPOP queue:gemini)
+            [ -n "$id" ] || { echo "queue empty"; exit 0; }
+            r GET "task:gemini:$id" > /workspace/task.json
+            [ -s /workspace/task.json ] && [ "$(head -c 1 /workspace/task.json)" = "{" ] || { echo "no task record for $id"; rm -f /workspace/task.json; exit 0; }
+            chmod 644 /workspace/task.json
+            # A repository fetched by the fetcher pod waits in Redis (base64 of a tar.gz, kept one hour).
+            if ! grep -q '"repo": null' /workspace/task.json; then
+              r GET "repo:gemini:$id" | base64 -d | tar -xzf - -C /workspace \
+                || { echo "repository for $id missing or expired (kept 1 hour)"; echo "{}" > /workspace/task.json; }
+            fi
+            echo "$id" > /meta/id; date -u +%Y-%m-%dT%H:%M:%SZ > /meta/started
+            echo "took $id"
+          env:
+          - name: REDISCLI_AUTH
+            valueFrom: {secretKeyRef: {name: redis-runners, key: gemini}}
+          resources: &small
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+          securityContext: &locked
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+          - {name: workspace, mountPath: /workspace}
+          - {name: meta, mountPath: /meta}
+        containers:
+        - name: agent
+          image: ghcr.io/miracaral/k8s-agent-sandbox-runner-gemini:0.1.2
+          imagePullPolicy: IfNotPresent
+          env:
+          - {name: HOME, value: /tmp/home}
+          # Headless runs need the working directory marked as trusted. /workspace holds only what the
+          # "take" container wrote; a fetched repository goes to /workspace/repo, below it (see threat model).
+          - {name: GEMINI_CLI_TRUST_WORKSPACE, value: "true"}
+          # Chosen explicitly, so a change of the CLI's default model cannot change cost or behaviour unnoticed.
+          - {name: GEMINI_MODEL, value: gemini-4-hydrogen}
+          - name: GEMINI_API_KEY
+            valueFrom: {secretKeyRef: {name: gemini-api, key: api-key, optional: true}}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext: *locked
+          volumeMounts:
+          - {name: workspace, mountPath: /workspace}
+          - {name: tmp, mountPath: /tmp}
+        - name: report
+          image: redis:7.4.11-alpine
+          command: ["sh", "-c"]
+          args:
+          - |
+            id=$(cat /meta/id 2>/dev/null)
+            k="result:gemini:$id"
+            r() { redis-cli -h redis.agents.svc.cluster.local --user gemini --no-auth-warning "$@" >/dev/null; }
+            now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+            summary() { head -c 65536 /workspace/out/summary.txt 2>/dev/null | redis-cli -h redis.agents.svc.cluster.local --user gemini --no-auth-warning -x HSET "$k" summary >/dev/null; }
+            stop() { [ -n "$id" ] && { summary; r HSET "$k" status timeout started_at "$(cat /meta/started)" finished_at "$(now)"; }; exit 0; }
+            trap stop TERM
+            while [ ! -f /workspace/out/done ]; do sleep 1; done
+            [ -n "$id" ] || exit 0
+            code=$(cat /workspace/out/exit_code 2>/dev/null || echo 1)
+            case "$code" in 0) status=succeeded ;; *) status=failed ;; esac
+            size=$(wc -c < /workspace/out/summary.txt)
+            [ "$size" -gt 65536 ] && cut=true || cut=false
+            summary
+            # The model the CLI really used: from its own log line when --debug is on, else the one it was told to use.
+            used=$(grep -o 'Using: [A-Za-z0-9._-]*' /workspace/out/summary.txt | tail -1 | cut -d' ' -f2)
+            r HSET "$k" model "${used:-requested $GEMINI_MODEL}"
+            r HSET "$k" status "$status" exit_code "$code" truncated "$cut" key_found "$(cat /workspace/out/key_found 2>/dev/null)" started_at "$(cat /meta/started)" finished_at "$(now)"
+            echo "reported $id: $status"
+          env:
+          - name: REDISCLI_AUTH
+            valueFrom: {secretKeyRef: {name: redis-runners, key: gemini}}
+          - {name: GEMINI_MODEL, value: gemini-4-hydrogen}   # keep equal to the agent's value
+          resources: *small
+          securityContext: *locked
+          volumeMounts:
+          - {name: workspace, mountPath: /workspace, readOnly: true}
+          - {name: meta, mountPath: /meta, readOnly: true}
+        volumes:
+        - name: workspace
+          emptyDir: {sizeLimit: 256Mi}
+        - name: meta
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+  triggers:
+  - type: redis
+    metadata:
+      address: redis.agents.svc.cluster.local:6379
+      username: keda
+      listName: queue:gemini
+      listLength: "1"
+    authenticationRef: {name: redis-keda}

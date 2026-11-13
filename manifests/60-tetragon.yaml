@@ -1,0 +1,24 @@
+# Tetragon: an independent record of what happens inside the agents namespace. Observation only, nothing
+# is blocked here. Tetragon already reports every process start and exit (with its arguments) for every
+# pod; this policy adds two things an injected agent would do:
+#   1) every outgoing TCP connection attempt, with its destination, recorded in the kernel before Cilium
+#      decides whether to drop it (so a refused attempt shows up even if Hubble does not report it);
+#   2) any read of a process environment file (/proc/<pid>/environ), the usual way to look for secrets.
+# Events go to Tetragon's export log on the node (export-stdout container of the tetragon pod).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicyNamespaced
+metadata: {name: agents-observe, namespace: agents}
+spec:
+  kprobes:
+  - call: tcp_connect
+    syscall: false
+    args:
+    - {index: 0, type: sock}
+  - call: security_file_permission
+    syscall: false
+    args:
+    - {index: 0, type: file}
+    - {index: 1, type: int}
+    selectors:
+    - matchArgs:
+      - {index: 0, operator: Postfix, values: ["/environ"]}

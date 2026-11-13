@@ -1,0 +1,50 @@
+# Free check, no generation: list the models the Gemini key may use. Same labels (so the same egress)
+# and the same restrictions as a Gemini task pod. The key comes from the Secret as an environment
+# variable and is sent in a header; it is never a process argument and is never printed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gemini-models-check
+  namespace: agents
+  labels: {agent-sandbox/runner: gemini}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - {key: kubernetes.io/hostname, operator: In, values: [worker-1]}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+  - name: check
+    image: ghcr.io/miracaral/k8s-agent-sandbox-runner-gemini:0.1.2
+    imagePullPolicy: IfNotPresent
+    command: ["node", "--input-type=module", "-e"]
+    args:
+    - |
+      const key = process.env.GEMINI_API_KEY || "";
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": key } });
+      const body = await r.text();
+      console.log("HTTP " + r.status);
+      console.log("key appears in the response: " + (key.length > 0 && body.includes(key)));
+      let d = {}; try { d = JSON.parse(body); } catch {}
+      if (d.error) console.log("error: " + d.error.status + " " + d.error.message);
+      for (const m of d.models || [])
+        if ((m.supportedGenerationMethods || []).includes("generateContent")) console.log(m.name);
+    env:
+    - name: GEMINI_API_KEY
+      valueFrom: {secretKeyRef: {name: gemini-api, key: api-key}}
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 500m, memory: 256Mi}
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: ["ALL"]}
