@@ -1,6 +1,6 @@
 # Threat model
 
-> Skeleton. It is filled in during the security audit, with before/after results of attacks actually run against the platform. Nothing here is a measured result yet.
+> Every result on this page was measured on the cluster described in [homelab-k8s-security](https://github.com/miracaral/homelab-k8s-security) (doc 10 there has the before/after tables). What was not measured says so.
 
 ## What is being protected
 
@@ -57,9 +57,9 @@ What these runs do **not** show:
 - **Whether the CLI would run a shell command at all in headless mode** was not tested: no shell call was made.
 - **Tetragon's kernel probes in the agent container:** in both real runs Tetragon recorded the agent's processes and its connection to the Gemini API. In two earlier model-free runs, where the stand-in acted in the first moment of the container's life, the probes recorded nothing for the agent container (process starts were recorded). So a very early action in the agent container may be missed by Tetragon's probes; Hubble recorded the dropped connection in that case. In the "obeyed" run the script waited 3 s before acting and both connections were recorded, which fits the guess of a start-up race; it does not prove it.
 
+## Known limitations
 
-
-*Filled in by the audit. Noted so far:*
+Measured or observed during the build and the audit:
 
 - **The ops agent can read pod definitions cluster-wide.** That includes environment variables written directly into a manifest. Values that come from a Secret are not shown (only the reference is), but a password someone typed into a pod spec is readable by the ops agent.
 - **The agent can read its model API key** (`GEMINI_API_KEY` in its environment). Egress allows only `generativelanguage.googleapis.com`, so the key can be sent there and nowhere else directly; the API itself is still a way out for anything the agent reads.
@@ -73,7 +73,7 @@ What these runs do **not** show:
 - **The limits are enforced by `labctl`.** Someone with the Redis admin password or `kubectl` rights in `agents` can queue tasks without being counted. Task pods cannot: their Redis user may not add to a queue.
 - **KEDA must be trusted.** Its operator reads the Redis password from the Secret, and as installed it can read every Secret in the `agents` namespace, including the Redis admin password and, later, the model API credentials.
 - **`agents kill` loses the running task.** The item was already taken from the queue; it is not put back.
-- **The `runner` Redis user can take items from any queue** (`queue:*`), so one runner could empty another runner's queue. To be narrowed to one queue per runner when the real runners arrive.
+- **Fixed in step 3e:** the shared `runner` Redis user, which could take items from any queue, was replaced by one user per runner (`gemini`, `claude`), each limited to its own queue, tasks and results.
 - **The audit log is not tamper-proof.** It lives in Redis; whoever holds the Redis admin password, or may `kubectl exec` into the Redis pod, can rewrite it.
 - **Redis is one pod on one node's local disk.** If that node is lost, the queue, the results and the audit log are lost with it.
 - **The ops agent can list what runs everywhere** (names, images, namespaces, events). It is an inventory of the cluster. Today that inventory can only leave through `kubectl exec` by the cluster's owner; once a model is attached (`ops ask`), it can leave to the model API.
