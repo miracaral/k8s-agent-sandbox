@@ -30,6 +30,7 @@ spec:
         restartPolicy: Never
         automountServiceAccountToken: false
         enableServiceLinks: false
+        dnsConfig: {options: [{name: ndots, value: "1"}]}
         terminationGracePeriodSeconds: 10
         # The image is loaded onto this worker only for now (no registry before the audit; worker-2 to follow).
         affinity:

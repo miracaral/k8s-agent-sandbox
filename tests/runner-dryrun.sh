@@ -5,9 +5,11 @@
 # (timeout 30 s for one test, restored), agents on/off. Run from the repository root on your machine.
 cd "$(dirname "$0")/.." || exit 1
 HOST=${LABCTL_SSH_HOST:-cp-1}; KC=${LABCTL_KUBECTL:-"sudo -n k3s kubectl"}
+NODE=${NODE:?"set NODE to the worker that runs the agents, e.g. NODE=<your worker>"}
+on_node() { sed -e "s/values: \[worker-1\]/values: [$NODE]/" -e "s/hostname: worker-1}/hostname: $NODE}/"; }
 k() { ssh -o BatchMode=yes "$HOST" "$KC $*"; }
 set_cmd() { k -n agents patch scaledjob gemini-runner --type json -p "'[{\"op\":\"add\",\"path\":\"/spec/jobTargetRef/template/spec/containers/0/env/-\",\"value\":{\"name\":\"AGENT_CMD\",\"value\":\"$1\"}}]'" >/dev/null; }
-reset_runner() { k -n agents delete scaledjob gemini-runner >/dev/null; k apply -f - < manifests/40-runner-gemini.yaml >/dev/null; }
+reset_runner() { k -n agents delete scaledjob gemini-runner >/dev/null; on_node < manifests/40-runner-gemini.yaml | k apply -f - >/dev/null; }
 wait_result() { for _ in $(seq 1 40); do out=$(./labctl result "$1"); rc=$?; [ $rc -le 1 ] && { echo "$out"; return; }; sleep 3; done; echo "no result after 120 s: $out"; }
 pod() { k -n agents get pods -l agent-sandbox/runner=gemini --field-selector status.phase=Running -o "jsonpath='{.items[*].metadata.name}'" 2>/dev/null | awk '{print $1}'; }
 need() { [ -n "$1" ] || { echo "STOP: $2"; ./labctl agents off >/dev/null; reset_runner; exit 1; }; }
@@ -37,7 +39,7 @@ node -e "const s=require('net').connect(6379,'redis.agents.svc.cluster.local');s
 t "gemini API :443 (expected open)" generativelanguage.googleapis.com 443
 t "other Google host :443" www.google.com 443
 t "internet 1.1.1.1:443" 1.1.1.1 443
-t "API server" kubernetes.default.svc 443
+t "API server" "$KUBERNETES_SERVICE_HOST" 443
 t "redis in jobs" redis.jobs.svc.cluster.local 6379
 EOF
 echo "-- report container (Redis user gemini)"

@@ -22,7 +22,7 @@ echo "== 3. Things it must not do (asked, not attempted)"
 can delete pods -A; can create pods -n agents-ops; can create pods/exec -n agents; can patch deployments -n agents-ops
 can create secrets -n agents-ops; can get secrets -n agents-ops; can create clusterrolebindings; can impersonate serviceaccounts
 echo "== 4. Network: the API server and nothing else"
-t "API server (must be open)" kubernetes.default.svc 443
+t "API server (must be open)" "$KUBERNETES_SERVICE_HOST" 443
 NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{end}')
 for n in $NODES; do t "node kubelet" $n 10250; t "node sshd" $n 22; done
 t "redis (jobs)" redis.jobs.svc.cluster.local 6379

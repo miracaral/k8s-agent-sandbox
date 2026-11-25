@@ -23,13 +23,15 @@ spec:
   egress:
   - {}
 ---
-# 2) DNS only, through the cluster's own resolver. The "rules: dns" part sends lookups through
-#    Cilium's DNS proxy, which the toFQDNs rules of later steps depend on.
+# 2) DNS through the cluster's own resolver, only for the names each role needs. Lookups go through
+#    Cilium's DNS proxy, which refuses every other name; the toFQDNs rules below learn their addresses
+#    from it. A pod without one of these labels (Redis) gets no DNS at all. Pods set ndots: 1, so a name
+#    is looked up as written and not first with the search suffixes (one of them goes to the home router).
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata: {name: allow-dns, namespace: agents}
-spec:
-  endpointSelector: {}
+specs:
+- endpointSelector: {matchLabels: {agent-sandbox/runner: gemini}}
   egress:
   - toEndpoints:
     - matchLabels:
@@ -38,13 +40,27 @@ spec:
     toPorts:
     - ports: [{port: "53", protocol: ANY}]
       rules:
-        dns: [{matchPattern: "*"}]
+        dns:
+        - matchName: generativelanguage.googleapis.com
+        - matchName: redis.agents.svc.cluster.local
+- endpointSelector: {matchLabels: {agent-sandbox/role: fetcher}}
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s-app: kube-dns
+    toPorts:
+    - ports: [{port: "53", protocol: ANY}]
+      rules:
+        dns:
+        - matchName: github.com
+        - matchName: redis.agents.svc.cluster.local
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata: {name: allow-dns, namespace: agents-ops}
 spec:
-  endpointSelector: {}
+  endpointSelector: {matchLabels: {app: ops-agent}}
   egress:
   - toEndpoints:
     - matchLabels:
@@ -53,7 +69,8 @@ spec:
     toPorts:
     - ports: [{port: "53", protocol: ANY}]
       rules:
-        dns: [{matchPattern: "*"}]
+        dns:
+        - matchName: kubernetes.default.svc.cluster.local
 ---
 # 3) Ops agent -> Kubernetes API server, and nothing else. No rule lets anything connect to the ops agent.
 apiVersion: cilium.io/v2

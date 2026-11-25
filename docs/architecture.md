@@ -20,7 +20,9 @@ Everything not in this table is dropped by the default-deny policy.
 
 | From | To | Why |
 | --- | --- | --- |
-| every pod | cluster DNS | names must resolve; also needed for name-based egress rules |
+| Gemini task pod | cluster DNS, only `generativelanguage.googleapis.com` and `redis.agents.svc.cluster.local` | the model and Redis; the name rules also feed the name-based egress rule |
+| fetcher pod | cluster DNS, only `github.com` and `redis.agents.svc.cluster.local` | GitHub and Redis |
+| ops agent | cluster DNS, only `kubernetes.default.svc.cluster.local` | kubectl itself uses the API server's address, not a name |
 | fetcher pod | `github.com` :443 | clone a public repository |
 | fetcher pod, task pod | Redis | take the task, store the repository and the result (the task pod's `agent` container can connect but has no password) |
 | Claude task pod (version 2) | `api.anthropic.com` :443 | the model |

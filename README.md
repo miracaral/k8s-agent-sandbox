@@ -28,7 +28,8 @@ your machine ── SSH ──> control-plane node ── kubectl ──> cluste
 | Control | What it limits | Status and evidence |
 | --- | --- | --- |
 | Pod Security `restricted` on both namespaces | no root, no privileged pod, no host mounts | built: a root pod is refused in both |
-| Default-deny network policy | a pod reaches DNS and nothing else until a rule allows more | built: from the platform's pods, the nodes, other namespaces, the local network and the internet are dropped (Hubble) |
+| Default-deny network policy | a pod reaches nothing until a rule allows it | built: from the platform's pods, the nodes, other namespaces, the local network and the internet are dropped (Hubble) |
+| DNS by name list | each role may look up only the names it needs; every other lookup is refused by Cilium's DNS proxy | built (2026-11-25): from a task pod, `github.com` and `<random>.example.com` are refused, the Gemini API and Redis resolve; no lookup reaches the home router |
 | Egress by name only (`toFQDNs`), never `0.0.0.0/0` | task pod: the Gemini API; fetcher pod: `github.com` | built: the task pod reaches the Gemini API and nothing else on the internet, not GitHub; the fetcher reaches `github.com` only |
 | Credentials split across containers | the agent container has the model key but no Redis password | built: the agent container's attempt to add a task to the queue is answered `NOAUTH` |
 | Redis users per role | each pod may touch only its own keys | built: every forbidden command of the runner, fetcher and KEDA users answers `NOPERM` |
@@ -49,7 +50,6 @@ The full list, with what was measured, is in [docs/threat-model.md](docs/threat-
 
 - **The agent can read its own API key.** The CLI needs it. The egress policy limits where it can be sent; the masking keeps it out of stored results; neither hides it from the agent.
 - **The allowed hosts are a way out.** Whatever the agent can read, it can send to its model API.
-- **DNS is a way out.** Task pods may look up any name, and a lookup can carry data to whoever runs the domain.
 - **A model can be talked into things.** In the tests it was not; the controls assume it eventually will be.
 - **KEDA must be trusted.** It can read every Secret in `agents`.
 - **A crash of the Redis node can lose up to 60 seconds of writes,** including counted tasks.
@@ -59,7 +59,6 @@ The full list, with what was measured, is in [docs/threat-model.md](docs/threat-
 
 Measured or observed, not fixed:
 
-- DNS lookups are allowed for any name, so a task pod can carry data out in a lookup.
 - The Gemini API, the one host a task pod may reach, can carry anything the agent reads.
 - The agent can read its own API key (it is masked in stored results, not hidden from the agent).
 - KEDA can read every Secret in `agents`.
@@ -67,7 +66,7 @@ Measured or observed, not fixed:
 - A crash of the node holding Redis can lose up to 60 seconds of writes, including counted tasks.
 - Tetragon's probes may miss an action in a container's first moment; Hubble still records dropped connections.
 - Results keep the first 64 KiB of output.
-- Node names in the manifests and `labctl`'s default SSH host (`cp-1`, `worker-1`) are placeholders: set `LABCTL_SSH_HOST` and the node affinity to your own.
+- Node names in the manifests and `labctl`'s default SSH host (`cp-1`, `worker-1`) are placeholders: set `LABCTL_SSH_HOST` and the node affinity to your own. `tests/runner-dryrun.sh` and `tests/fetcher-test.sh` also need `NODE`, the worker that runs the agents.
 
 Details and measurements: [docs/threat-model.md](docs/threat-model.md#known-limitations).
 
